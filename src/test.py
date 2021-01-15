@@ -16,19 +16,48 @@ import time
 from easydict import EasyDict as edict
 import cv2
 import torch
+import torch.nn as nn
 import numpy as np
+
+import onnx
+import onnxruntime as rt
 
 sys.path.append('../')
 
 import config.kitti_config as cnf
 from data_process import kitti_data_utils, kitti_bev_utils
 from data_process.kitti_dataloader import create_test_dataloader
-from models.model_utils import create_model
+from models.model_utils import create_model, create_model_yolo_only
 from utils.misc import make_folder
 from utils.evaluation_utils import post_processing, rescale_boxes, post_processing_v2
 from utils.misc import time_synchronized
 from utils.visualization_utils import show_image_with_boxes, merge_rgb_to_bev, predictions_to_kitti_format
 
+def fuse_model(m):
+    prev_previous_type = nn.Identity()
+    prev_previous_name = ''
+    previous_type = nn.Identity()
+    previous_name = ''
+    for name, module in m.named_modules():
+        if isinstance(module, torch.nn.Module)==False:
+           print("\n\n\n !!! not Module = ", name)
+           print(module)
+           print(type(module))
+
+        if prev_previous_type == nn.Conv2d and previous_type == nn.BatchNorm2d and type(module) == nn.ReLU:
+            print("FUSED ", prev_previous_name, previous_name, name)
+            torch.quantization.fuse_modules(m, [prev_previous_name, previous_name, name], inplace=True)
+        elif prev_previous_type == nn.Conv2d and previous_type == nn.BatchNorm2d:
+            print("FUSED ", prev_previous_name, previous_name)
+            torch.quantization.fuse_modules(m, [prev_previous_name, previous_name], inplace=True)
+        elif previous_type == nn.Conv2d and type(module) == nn.ReLU:
+            print("FUSED ", previous_name, name)
+            #torch.quantization.fuse_modules(m, [previous_name, name], inplace=True)
+
+        prev_previous_type = previous_type
+        prev_previous_name = previous_name
+        previous_type = type(module)
+        previous_name = name
 
 def parse_test_configs():
     parser = argparse.ArgumentParser(description='Demonstration config for Complex YOLO Implementation')
@@ -93,24 +122,78 @@ if __name__ == '__main__':
 
     model = create_model(configs)
     model.print_network()
+
+    model_yolo = create_model_yolo_only(configs)
+    model_yolo.print_network()
     print('\n\n' + '-*=' * 30 + '\n\n')
     assert os.path.isfile(configs.pretrained_path), "No file at {}".format(configs.pretrained_path)
-    model.load_state_dict(torch.load(configs.pretrained_path))
+    model.load_state_dict(torch.load(configs.pretrained_path, map_location="cpu"))
+    
+    print("configs.img_size = ", configs.img_size)
+    rand_example = torch.rand(1, 3, configs.img_size, configs.img_size)
+    #print("backbone...")
+    fuse_model(model)
+    model.eval()
+    with torch.no_grad():
+        tmp = model(rand_example)
+    torch.onnx.export(model, rand_example, 'model.onnx', opset_version=9)  
+    
+    print("loading model...")
+    model = rt.InferenceSession('model.onnx')
+    input_name = model.get_inputs()[0].name
+    output_name = model.get_outputs()[0].name
+    print("output_name = ", output_name)
+    print("model loaded! \n")
+    
+
+    
+
+    #model = torch.jit.trace(model, rand_example)
+    #traced_script_module = torch.jit.script(model)
+
+    print("model = ", model)
+    
+    
+    #model = model.to(memory_format=torch.channels_last)  
+    #model = model.half()
 
     configs.device = torch.device('cpu' if configs.no_cuda else 'cuda:{}'.format(configs.gpu_idx))
-    model = model.to(device=configs.device)
+    #model = model.to(device=configs.device)
+    model_yolo = model_yolo.to(device=configs.device)
 
     out_cap = None
 
-    model.eval()
+    #model.eval()
+    model_yolo.eval()
 
     test_dataloader = create_test_dataloader(configs)
     with torch.no_grad():
         for batch_idx, (img_paths, imgs_bev) in enumerate(test_dataloader):
-            input_imgs = imgs_bev.to(device=configs.device).float()
+            #input_imgs = imgs_bev.to(device=configs.device).float()
+            input_imgs = imgs_bev.float()
+
+            #input_imgs = input_imgs.to(memory_format=torch.channels_last)  
+            #input_imgs = input_imgs.half()
+
+            num_array = input_imgs.numpy()
+                        
             t1 = time_synchronized()
-            outputs = model(input_imgs)
+            outputs = model.run(['1180', '1157', '1134'], {input_name: num_array})
+            #outputs = torch.tensor(outputs)
+            outputs = [outputs[0], outputs[1], outputs[2]]
+            
+            for index, item in enumerate(outputs):
+                outputs[index] = torch.tensor(item).to(device=configs.device).half()
+                     
+            #outputs = model(input_imgs)
+            outputs = model_yolo(outputs, input_imgs)
+
             t2 = time_synchronized()
+
+            #print("outputs.shape = ", outputs.shape)
+            #print("outputs.type = ", outputs.type)
+            #print(outputs)
+            
             detections = post_processing_v2(outputs, conf_thresh=configs.conf_thresh, nms_thresh=configs.nms_thresh)
 
             img_detections = []  # Stores detections for each image index
@@ -140,11 +223,17 @@ if __name__ == '__main__':
 
             print('\tDone testing the {}th sample, time: {:.1f}ms, speed {:.2f}FPS'.format(batch_idx, (t2 - t1) * 1000,
                                                                                            1 / (t2 - t1)))
-
+            print("configs.save_test_output = ", configs.save_test_output)
             if configs.save_test_output:
+                print("configs.output_format = ", configs.output_format)
                 if configs.output_format == 'image':
+                    print("try...")
+                    print("img_paths[0] = ", img_paths[0])
+                    print("os.path.basename(img_paths[0]) = ", os.path.basename(img_paths[0]))
                     img_fn = os.path.basename(img_paths[0])[:-4]
+                    print("img_fn = ", img_fn)
                     cv2.imwrite(os.path.join(configs.results_dir, '{}.jpg'.format(img_fn)), out_img)
+                    print("img savedsaved_fn")
                 elif configs.output_format == 'video':
                     if out_cap is None:
                         out_cap_h, out_cap_w = out_img.shape[:2]
@@ -162,6 +251,9 @@ if __name__ == '__main__':
                 print('\n[INFO] Press n to see the next sample >>> Press Esc to quit...\n')
                 if cv2.waitKey(0) & 0xFF == 27:
                     break
+            
     if out_cap:
         out_cap.release()
     cv2.destroyAllWindows()
+
+

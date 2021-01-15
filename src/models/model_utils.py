@@ -14,7 +14,7 @@ import torch
 
 sys.path.append('../')
 
-from models.darknet2pytorch import Darknet
+from models.darknet2pytorch import Darknet, YOLO_only
 
 
 def create_model(configs):
@@ -22,6 +22,16 @@ def create_model(configs):
     if (configs.arch == 'darknet') and (configs.cfgfile is not None):
         print('using darknet')
         model = Darknet(cfgfile=configs.cfgfile, use_giou_loss=configs.use_giou_loss)
+    else:
+        assert False, 'Undefined model backbone'
+
+    return model
+
+def create_model_yolo_only(configs):
+    """Create model based on architecture name"""
+    if (configs.arch == 'darknet') and (configs.cfgfile is not None):
+        print('using darknet')
+        model = YOLO_only(cfgfile=configs.cfgfile, use_giou_loss=configs.use_giou_loss)
     else:
         assert False, 'Undefined model backbone'
 

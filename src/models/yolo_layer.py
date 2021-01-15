@@ -141,7 +141,7 @@ class YoloLayer(nn.Module):
         return iou_scores, giou_loss, class_mask, obj_mask.type(torch.bool), noobj_mask.type(torch.bool), \
                tx, ty, tw, th, tim, tre, tcls, tconf
 
-    def forward(self, x, targets=None, img_size=608, use_giou_loss=False):
+    def forward(self, x, targets=None, img_size=int(608), use_giou_loss=False):
         """
         :param x: [num_samples or batch, num_anchors * (6 + 1 + num_classes), grid_size, grid_size]
         :param targets: [num boxes, 8] (box_idx, class, x, y, w, l, sin(yaw), cos(yaw))

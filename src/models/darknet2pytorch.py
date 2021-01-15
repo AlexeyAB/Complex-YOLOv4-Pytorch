@@ -26,7 +26,37 @@ class Mish(nn.Module):
     def forward(self, x):
         x = x * (torch.tanh(F.softplus(x)))
         return x
+"""
+class Mish(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    @staticmethod
+    @torch.jit.script
+    def forward(x):
+        e = torch.exp(x)
+        n = torch.mul(e, e) + torch.mul(2, e)
+        out = torch.where((x <= -0.6), torch.mul(x, torch.div(n, n+2)), x - torch.mul(2, torch.div(x, n+2)))
+        return out
 
+
+class Mish(nn.Module):
+    class F(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.save_for_backward(x)
+            return x.mul(torch.tanh(F.softplus(x)))  # x * tanh(ln(1 + exp(x)))
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x = ctx.saved_tensors[0]
+            sx = torch.sigmoid(x)
+            fx = F.softplus(x).tanh()
+            return grad_output * (fx + x * sx * (1 - fx * fx))
+
+    def forward(self, x):
+        return self.F.apply(x)
+"""
 
 class MaxPoolDark(nn.Module):
     def __init__(self, size=2, stride=1):
@@ -43,6 +73,7 @@ class MaxPoolDark(nn.Module):
         torch output_size = (input_size + 2*p -k) / s +1
         p : padding = k//2
         '''
+        
         p = self.size // 2
         if ((x.shape[2] - 1) // self.stride) != ((x.shape[2] + 2 * p - self.size) // self.stride):
             padding1 = (self.size - 1) // 2
@@ -58,6 +89,7 @@ class MaxPoolDark(nn.Module):
             padding4 = padding3
         x = F.max_pool2d(F.pad(x, (padding3, padding4, padding1, padding2), mode='replicate'),
                          self.size, stride=self.stride)
+        
         return x
 
 
@@ -141,13 +173,28 @@ class EmptyModule(nn.Module):
     def forward(self, x):
         return x
 
+class DictWrapper(nn.Module):
+    def __init__(self, dict_block):
+        super(DictWrapper, self).__init__()
+        self.dict_block = dict_block
+
+    def __getitem__(self, item):
+         return self.dict_block[item]
+
+    def keys(self):
+        return self.dict_block.keys()
 
 # support route shortcut and reorg
 class Darknet(nn.Module):
     def __init__(self, cfgfile, use_giou_loss):
         super(Darknet, self).__init__()
         self.use_giou_loss = use_giou_loss
-        self.blocks = parse_cfg(cfgfile)
+        dict_blocks = parse_cfg(cfgfile)
+        self.blocks = nn.ModuleList()
+        for block in dict_blocks:
+            self.blocks.append(DictWrapper(block))
+
+        #self.blocks = nn.ModuleList(parse_cfg(cfgfile))
         self.width = int(self.blocks[0]['width'])
         self.height = int(self.blocks[0]['height'])
 
@@ -163,17 +210,18 @@ class Darknet(nn.Module):
         # batch_size, c, h, w
         img_size = x.size(2)
         ind = -2
-        self.loss = None
+        #self.loss = None
         outputs = dict()
         loss = 0.
         yolo_outputs = []
-        for block in self.blocks:
+        for block_wrapper in self.blocks:
+            block = block_wrapper.dict_block
             ind = ind + 1
             # if ind > 0:
             #    return x
 
             if block['type'] == 'net':
-                continue
+                x = x
             elif block['type'] in ['convolutional', 'maxpool', 'reorg', 'upsample', 'avgpool', 'softmax', 'connected']:
                 x = self.models[ind](x)
                 outputs[ind] = x
@@ -218,14 +266,16 @@ class Darknet(nn.Module):
                     x = F.relu(x, inplace=True)
                 outputs[ind] = x
             elif block['type'] == 'yolo':
-                x, layer_loss = self.models[ind](x, targets, img_size, self.use_giou_loss)
-                loss += layer_loss
+                #x, layer_loss = self.models[ind](x, targets, img_size, self.use_giou_loss)
+                #loss += layer_loss
                 yolo_outputs.append(x)
             elif block['type'] == 'cost':
-                continue
+                x = x
             else:
                 print('unknown type %s' % (block['type']))
-        yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
+        #yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
+        #yolo_outputs = torch.cat(yolo_outputs, 1)
+        #yolo_outputs = x
 
         return yolo_outputs if targets is None else (loss, yolo_outputs)
 
@@ -377,7 +427,7 @@ class Darknet(nn.Module):
                 out_filters.append(prev_filters)
                 out_strides.append(prev_stride)
                 models.append(model)
-            elif block['type'] == 'yolo':
+            elif block['type'] == 'yolo1':
                 anchor_masks = [int(i) for i in block['mask'].split(',')]
                 anchors = [float(i) for i in block['anchors'].split(',')]
                 anchors = [(anchors[i], anchors[i + 1], math.sin(anchors[i + 2]), math.cos(anchors[i + 2])) for i in
@@ -449,3 +499,84 @@ class Darknet(nn.Module):
                 pass
             else:
                 print('unknown type %s' % (block['type']))
+
+
+
+
+class YOLO_only(nn.Module):
+    def __init__(self, cfgfile, use_giou_loss):
+        super(YOLO_only, self).__init__()
+        self.use_giou_loss = use_giou_loss
+        dict_blocks = parse_cfg(cfgfile)
+        self.blocks = nn.ModuleList()
+        for block in dict_blocks:
+            self.blocks.append(DictWrapper(block))
+
+        #self.blocks = nn.ModuleList(parse_cfg(cfgfile))
+        self.width = int(self.blocks[0]['width'])
+        self.height = int(self.blocks[0]['height'])
+
+        self.models = self.create_network(self.blocks)  # merge conv, bn,leaky
+        self.yolo_layers = [layer for layer in self.models if layer.__class__.__name__ == 'YoloLayer']
+
+        self.loss = self.models[len(self.models) - 1]
+
+        self.header = torch.IntTensor([0, 0, 0, 0])
+        self.seen = 0
+
+    def forward(self, input, source_image, targets=None):
+        # batch_size, c, h, w
+        img_size = source_image.size(2)
+        ind = 0
+        #self.loss = None
+        outputs = dict()
+        loss = 0.
+        yolo_outputs = []
+        for block_wrapper in self.blocks:
+            block = block_wrapper.dict_block            
+
+            if block['type'] == 'yolo':
+                x, layer_loss = self.models[ind](input[ind], targets, img_size, self.use_giou_loss)
+                loss += layer_loss
+                yolo_outputs.append(x)
+                ind = ind + 1
+
+        yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
+        #yolo_outputs = torch.cat(yolo_outputs, 1)
+        #yolo_outputs = x
+
+        return yolo_outputs if targets is None else (loss, yolo_outputs)
+
+    def print_network(self):
+        print_cfg(self.blocks)
+
+    def create_network(self, blocks):
+        models = nn.ModuleList()
+
+        prev_filters = 3
+        out_filters = []
+        prev_stride = 1
+        out_strides = []
+        conv_id = 0
+        for block in blocks:
+            if block['type'] == 'yolo':
+                anchor_masks = [int(i) for i in block['mask'].split(',')]
+                anchors = [float(i) for i in block['anchors'].split(',')]
+                anchors = [(anchors[i], anchors[i + 1], math.sin(anchors[i + 2]), math.cos(anchors[i + 2])) for i in
+                           range(0, len(anchors), 3)]
+                anchors = [anchors[i] for i in anchor_masks]
+
+                num_classes = int(block['classes'])
+                self.num_classes = num_classes
+                scale_x_y = float(block['scale_x_y'])
+                ignore_thresh = float(block['ignore_thresh'])
+
+                yolo_layer = YoloLayer(num_classes=num_classes, anchors=anchors, stride=prev_stride,
+                                       scale_x_y=scale_x_y, ignore_thresh=ignore_thresh)
+
+                out_filters.append(prev_filters)
+                out_strides.append(prev_stride)
+                models.append(yolo_layer)
+
+
+        return models
